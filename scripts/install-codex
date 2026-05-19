@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_CONFIG_HOME="${CODEX_HOME:-$HOME/.codex}"
+
+SKILLS_DIR="$CODEX_CONFIG_HOME/skills"
+DEST_SKILL="$SKILLS_DIR/follow-up"
+
+mkdir -p "$SKILLS_DIR"
+
+if [[ "$SOURCE_ROOT" != "$DEST_SKILL" ]]; then
+    TMP_DEST="$DEST_SKILL.tmp.$$"
+    rm -rf "$TMP_DEST"
+    cp -R "$SOURCE_ROOT" "$TMP_DEST"
+    rm -rf \
+        "$TMP_DEST/.git" \
+        "$TMP_DEST/.agents" \
+        "$TMP_DEST/.codex"
+    rm -rf "$DEST_SKILL"
+    mv "$TMP_DEST" "$DEST_SKILL"
+fi
+
+chmod +x "$DEST_SKILL/scripts/follow-up"
+chmod +x "$DEST_SKILL/scripts/install-codex"
+
+cat <<EOF
+follow-up installed.
+  skill:    $DEST_SKILL
+  entrypoint: $DEST_SKILL/scripts/follow-up
+
+Restart Codex to pick up the skill metadata.
+EOF
