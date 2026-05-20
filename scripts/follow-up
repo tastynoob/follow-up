@@ -2,21 +2,28 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
-import shlex
 import socket
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
-VERSION = "0.3.0"
+VERSION = "0.7.2"
 MANAGED_MARKER = "FOLLOW_UP_MANAGED=1"
-STATE_DIR_NAME = "follow-up"
-DEFAULT_HOOK_TIMEOUT_SECONDS = 300
+STATE_DIR_NAME = ".follow-up"
+EVENT_FILE_NAME = "event.json"
+LOCK_FILE_NAME = "event.lock"
+DEFAULT_HOOK_TIMEOUT_SECONDS = 7200
+HOOK_TIMEOUT_MARGIN_SECONDS = 30
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600
+DEFAULT_HOOK_POLL_SECONDS = 10
+DEFAULT_ARM_MAX_AGE_SECONDS = 120
 DEFAULT_FAILURE_PROMPT = (
     "The previous command failed. Inspect the Codex command output, identify the likely cause, "
     "and decide whether to fix and rerun the failing command or report the blocker with evidence."
@@ -29,6 +36,10 @@ class UserError(Exception):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def now_unix() -> float:
+    return time.time()
 
 
 def codex_home() -> Path:
@@ -46,19 +57,28 @@ def hooks_file() -> Path:
     return codex_home() / "hooks.json"
 
 
-def state_root() -> Path:
+def workspace_root(cwd: Path) -> Path:
+    current = cwd.expanduser().absolute()
+    for path in (current, *current.parents):
+        git_path = path / ".git"
+        if git_path.is_file() or (git_path / "config").is_file():
+            return path
+    return current
+
+
+def state_root(cwd: Path | None = None) -> Path:
     override = env_override("FOLLOW_UP_STATE_DIR")
     if override:
         return Path(override).expanduser()
-    return codex_home() / STATE_DIR_NAME
+    return workspace_root(cwd or Path.cwd()) / STATE_DIR_NAME
 
 
-def runs_root() -> Path:
-    return state_root() / "runs"
+def event_file(cwd: Path | None = None) -> Path:
+    return state_root(cwd) / EVENT_FILE_NAME
 
 
-def script_path() -> Path:
-    return Path(__file__).resolve()
+def lock_file(cwd: Path | None = None) -> Path:
+    return state_root(cwd) / LOCK_FILE_NAME
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -76,6 +96,34 @@ def atomic_write_json(path: Path, data: Any) -> None:
         json.dump(data, fh, indent=2, sort_keys=True)
         fh.write("\n")
     os.replace(tmp, path)
+
+
+@contextmanager
+def locked_event(cwd: Path | None = None) -> Iterator[None]:
+    path = lock_file(cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def load_event(cwd: Path | None = None) -> dict[str, Any] | None:
+    data = read_json(event_file(cwd))
+    return data if isinstance(data, dict) else None
+
+
+def write_event(event: dict[str, Any], cwd: Path | None = None) -> None:
+    atomic_write_json(event_file(cwd), event)
+
+
+def clear_event(cwd: Path | None = None) -> None:
+    try:
+        event_file(cwd).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def json_hook_response(reason: str) -> None:
@@ -98,7 +146,7 @@ def parse_positive_int(value: str, name: str) -> int:
 
 def env_positive_int(name: str, default: int) -> int:
     value = env_override(name)
-    if value is None:
+    if value is None or value == "":
         return default
     try:
         return parse_positive_int(value, name)
@@ -106,8 +154,30 @@ def env_positive_int(name: str, default: int) -> int:
         raise UserError(str(exc)) from exc
 
 
-def shell_env_assignment(name: str, value: str) -> str:
-    return f"{name}={shlex.quote(value)}"
+def hook_timeout_seconds() -> int:
+    return env_positive_int("FOLLOW_UP_HOOK_TIMEOUT", DEFAULT_HOOK_TIMEOUT_SECONDS)
+
+
+def max_command_timeout_seconds() -> int:
+    max_seconds = effective_hook_timeout_seconds() - HOOK_TIMEOUT_MARGIN_SECONDS
+    if max_seconds <= 0:
+        raise UserError("installed follow-up hook timeout is too small for follow-up timeout guard")
+    return max_seconds
+
+
+def validate_command_timeout(seconds: int) -> int:
+    max_seconds = max_command_timeout_seconds()
+    if seconds > max_seconds:
+        raise UserError(
+            f"follow-up --timeout must be <= {max_seconds} seconds so the hook can report before "
+            f"its {effective_hook_timeout_seconds()} second process timeout"
+        )
+    return seconds
+
+
+def default_command_timeout_seconds() -> int:
+    configured = env_positive_int("FOLLOW_UP_COMMAND_TIMEOUT_SECONDS", DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    return validate_command_timeout(configured)
 
 
 def current_session_id() -> str | None:
@@ -118,137 +188,70 @@ def current_session_id() -> str | None:
     return None
 
 
-def managed_hook_command() -> str:
-    assignments = [
-        MANAGED_MARKER,
-        shell_env_assignment("CODEX_HOME", str(codex_home())),
-        shell_env_assignment("FOLLOW_UP_HOOKS_FILE", str(hooks_file())),
-        shell_env_assignment("FOLLOW_UP_STATE_DIR", str(state_root())),
-    ]
-    hook_timeout = env_override("FOLLOW_UP_HOOK_TIMEOUT")
-    if hook_timeout:
-        assignments.append(shell_env_assignment("FOLLOW_UP_HOOK_TIMEOUT", hook_timeout))
-
-    command = [shlex.quote(sys.executable), shlex.quote(str(script_path())), "--hook"]
-    return " ".join(assignments + command)
+def require_session_id() -> str:
+    session_id = current_session_id()
+    if not session_id:
+        raise UserError(
+            "Codex session id not found; follow-up requires CODEX_THREAD_ID or CODEX_SESSION_ID "
+            "to avoid cross-session delivery"
+        )
+    return session_id
 
 
-def stop_groups(data: dict[str, Any]) -> list[Any]:
-    hooks = data.setdefault("hooks", {})
-    if "Stop" not in hooks or hooks["Stop"] is None:
-        groups = []
-        hooks["Stop"] = groups
-        return groups
-    groups = hooks["Stop"]
-    if not isinstance(groups, list):
-        raise UserError("hooks.Stop must be an array")
-    return groups
+def hook_session_id(hook_input: dict[str, Any]) -> str | None:
+    value = hook_input.get("session_id")
+    return value if isinstance(value, str) and value else None
 
 
-def is_managed_hook(hook: Any) -> bool:
-    if not isinstance(hook, dict):
-        return False
-    command = hook.get("command")
-    return (
-        isinstance(command, str)
-        and MANAGED_MARKER in command
-        and "--hook" in command
-    )
+def persistent_hook_present() -> bool:
+    return installed_hook_timeout_seconds() is not None
 
 
-def normalize_hooks_config(data: Any, path: Path) -> dict[str, Any]:
-    if data is None:
-        return {"description": "Codex hooks", "hooks": {}}
+def managed_hook_timeouts() -> list[int]:
+    try:
+        data = read_json(hooks_file(), {})
+    except Exception:
+        return []
     if not isinstance(data, dict):
-        raise UserError(f"hooks file must contain a JSON object: {path}")
-    hooks = data.setdefault("hooks", {})
+        return []
+    hooks = data.get("hooks")
     if not isinstance(hooks, dict):
-        raise UserError(f"hooks file has invalid 'hooks' object: {path}")
-    return data
-
-
-def prune_managed_hooks(data: dict[str, Any]) -> bool:
-    changed = False
-    groups = stop_groups(data)
-    hooks = data.setdefault("hooks", {})
-    new_groups: list[Any] = []
-    for group in groups:
+        return []
+    stop_groups = hooks.get("Stop", [])
+    if not isinstance(stop_groups, list):
+        return []
+    timeouts: list[int] = []
+    for group in stop_groups:
         if not isinstance(group, dict):
-            new_groups.append(group)
             continue
         group_hooks = group.get("hooks", [])
         if not isinstance(group_hooks, list):
-            new_groups.append(group)
             continue
-
-        kept_hooks = [hook for hook in group_hooks if not is_managed_hook(hook)]
-        if len(kept_hooks) != len(group_hooks):
-            changed = True
-
-        if kept_hooks:
-            new_group = dict(group)
-            new_group["hooks"] = kept_hooks
-            new_groups.append(new_group)
-        else:
-            other_keys = {k: v for k, v in group.items() if k != "hooks"}
-            if other_keys:
-                new_group = dict(other_keys)
-                new_group["hooks"] = []
-                new_groups.append(new_group)
-
-    if changed:
-        hooks["Stop"] = new_groups
-    return changed
+        for hook in group_hooks:
+            if not isinstance(hook, dict):
+                continue
+            command = hook.get("command")
+            if isinstance(command, str) and MANAGED_MARKER in command and "--hook" in command:
+                timeout = hook.get("timeout")
+                if isinstance(timeout, int) and timeout > 0:
+                    timeouts.append(timeout)
+    return timeouts
 
 
-def write_hooks_config(path: Path, data: dict[str, Any]) -> None:
-    if path.exists():
-        backup = path.with_name(f"{path.name}.bak.follow-up")
-        try:
-            backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-        except OSError:
-            pass
-    atomic_write_json(path, data)
+def installed_hook_timeout_seconds() -> int | None:
+    timeouts = managed_hook_timeouts()
+    if not timeouts:
+        return None
+    return min(timeouts)
 
 
-def register_hook() -> Path:
-    timeout_seconds = env_positive_int("FOLLOW_UP_HOOK_TIMEOUT", DEFAULT_HOOK_TIMEOUT_SECONDS)
-    path = hooks_file()
-    data = normalize_hooks_config(read_json(path), path)
-    prune_managed_hooks(data)
-
-    groups = stop_groups(data)
-    groups.append(
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": managed_hook_command(),
-                    "timeout": timeout_seconds,
-                    "statusMessage": "follow-up returning command feedback",
-                }
-            ]
-        }
-    )
-    write_hooks_config(path, data)
-    return path
+def effective_hook_timeout_seconds() -> int:
+    return installed_hook_timeout_seconds() or hook_timeout_seconds()
 
 
-def unregister_hook() -> tuple[bool, str | None]:
-    path = hooks_file()
-    try:
-        data = normalize_hooks_config(read_json(path), path)
-        changed = prune_managed_hooks(data)
-        if changed:
-            write_hooks_config(path, data)
-        return changed, None
-    except Exception as exc:
-        return False, str(exc)
-
-
-def run_id() -> str:
+def event_id(prefix: str = "") -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{timestamp}-{os.getpid()}-{time.time_ns() % 100000000:08d}"
+    return f"{prefix}{timestamp}-{os.getpid()}-{time.time_ns() % 100000000:08d}"
 
 
 def exit_code_from_env() -> int | None:
@@ -269,56 +272,89 @@ def result_status(exit_code: int | None) -> str:
     return "failed"
 
 
-def create_notification(feedback: str, exit_code: int | None) -> None:
-    run = run_id()
-    run_dir = runs_root() / run
-    run_dir.mkdir(parents=True, exist_ok=False)
-    created_at = now_iso()
+def join_feedback(items: list[str]) -> str:
+    if "--" in items:
+        raise UserError(
+            'follow-up does not execute commands; use: follow-up "feedback"; '
+            'command; rc=$?; follow-up --finished --exit-code "$rc"'
+        )
+    feedback = " ".join(items).strip()
+    if not feedback:
+        raise UserError('usage: follow-up "feedback text"')
+    return feedback
 
-    request = {
-        "schema_version": 1,
+
+def arm_event(feedback: str, timeout_seconds: int) -> None:
+    created_at = now_iso()
+    created_at_unix = now_unix()
+    cwd = Path.cwd()
+    workspace = workspace_root(cwd)
+    session_id = require_session_id()
+    max_age = env_positive_int("FOLLOW_UP_ARM_MAX_AGE_SECONDS", DEFAULT_ARM_MAX_AGE_SECONDS)
+
+    event = {
+        "schema_version": 3,
         "version": VERSION,
         "mode": "codex-command-follow-up",
-        "run_id": run,
+        "event_id": event_id(),
+        "status": "pending",
         "created_at": created_at,
-        "cwd": str(Path.cwd()),
+        "created_at_unix": created_at_unix,
+        "expires_at_unix": created_at_unix + max_age,
+        "cwd": str(cwd),
+        "workspace_root": str(workspace),
         "host": socket.gethostname(),
         "feedback": feedback,
+        "session_id": session_id,
+        "timeout_seconds": validate_command_timeout(timeout_seconds),
+        "hook_timeout_seconds": effective_hook_timeout_seconds(),
     }
-    session_id = current_session_id()
-    if session_id:
-        request["session_id"] = session_id
-    atomic_write_json(run_dir / "request.json", request)
 
-    result = {
-        "status": result_status(exit_code),
-        "exit_code": exit_code,
-        "finished_at": created_at,
-    }
-    atomic_write_json(run_dir / "result.json", result)
-    atomic_write_json(run_dir / "state.json", {"status": "armed", "created_at": created_at})
+    with locked_event():
+        write_event(event)
 
-    hook_path = register_hook()
+    if not persistent_hook_present():
+        print(
+            "warning: persistent Stop hook not found; run scripts/install-codex and restart Codex before relying on follow-up.",
+            file=sys.stderr,
+        )
 
-    print(f"follow-up armed: {run}")
-    print(f"hook file: {hook_path}")
-    print(f"run dir: {run_dir}")
+    print(f"follow-up armed: {event['event_id']}")
+    print(
+        "follow-up agent instruction: after launching the combined shell command, stop the turn immediately. "
+        "Do not poll the running session; the installed Stop hook waits for --finished.",
+        file=sys.stderr,
+    )
+
+
+def finish_event(exit_code: int | None) -> None:
+    session_id = require_session_id()
+    cwd = Path.cwd()
+    with locked_event(cwd):
+        event = load_event(cwd)
+        if not event:
+            raise UserError("no active follow-up event in this workspace")
+        if event.get("session_id") != session_id:
+            raise UserError("active follow-up event belongs to a different Codex session")
+        if request_workspace(event) != workspace_root(cwd):
+            raise UserError("active follow-up event belongs to a different workspace")
+
+        finished_at = now_iso()
+        finished_at_unix = now_unix()
+        event["status"] = "finished"
+        event["result"] = {
+            "status": result_status(exit_code),
+            "exit_code": exit_code,
+            "finished_at": finished_at,
+            "finished_at_unix": finished_at_unix,
+        }
+        write_event(event, cwd)
+
+    print(f"follow-up finished: {event.get('event_id', 'unknown')}")
     if exit_code is None:
         print("exit code: unknown")
     else:
         print(f"exit code: {exit_code}")
-    print("Stop normally now. The managed Stop hook will return the follow-up instruction.")
-
-
-def iter_run_dirs() -> list[Path]:
-    root = runs_root()
-    if not root.exists():
-        return []
-    return sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name)
-
-
-def is_delivered(run_dir: Path) -> bool:
-    return (run_dir / "delivered.json").exists()
 
 
 def load_hook_input() -> dict[str, Any]:
@@ -332,46 +368,129 @@ def load_hook_input() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def run_matches_hook(run_dir: Path, hook_input: dict[str, Any]) -> bool:
-    if is_delivered(run_dir):
+def request_workspace(event: dict[str, Any]) -> Path | None:
+    value = event.get("workspace_root")
+    if isinstance(value, str) and value:
+        return Path(value).expanduser().absolute()
+    cwd = event.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        return workspace_root(Path(cwd))
+    return None
+
+
+def hook_workspace(hook_cwd: Path) -> Path:
+    return workspace_root(hook_cwd)
+
+
+def event_matches_context(event: dict[str, Any], hook_input: dict[str, Any], hook_cwd: Path) -> bool:
+    session_id = hook_session_id(hook_input)
+    if not isinstance(session_id, str) or event.get("session_id") != session_id:
         return False
-    request = read_json(run_dir / "request.json")
-    if not isinstance(request, dict):
+
+    workspace = request_workspace(event)
+    if workspace is None:
         return False
+    return workspace == hook_workspace(hook_cwd)
 
-    hook_cwd = hook_input.get("cwd")
-    request_cwd = request.get("cwd")
-    if isinstance(hook_cwd, str) and isinstance(request_cwd, str) and Path(hook_cwd) != Path(request_cwd):
+
+def is_event_fresh(event: dict[str, Any], current_time: float) -> bool:
+    expires_at = event.get("expires_at_unix")
+    if isinstance(expires_at, (int, float)):
+        return current_time <= float(expires_at)
+
+    created_at = event.get("created_at_unix")
+    if not isinstance(created_at, (int, float)):
         return False
+    max_age = env_positive_int("FOLLOW_UP_ARM_MAX_AGE_SECONDS", DEFAULT_ARM_MAX_AGE_SECONDS)
+    return current_time - float(created_at) <= max_age
 
-    session_id = hook_input.get("session_id")
-    request_session_id = request.get("session_id")
-    if isinstance(request_session_id, str):
-        return isinstance(session_id, str) and request_session_id == session_id
-    if isinstance(session_id, str):
+
+def event_timeout_seconds(event: dict[str, Any]) -> int:
+    value = event.get("timeout_seconds")
+    if isinstance(value, int) and value > 0:
+        return min(value, max_command_timeout_seconds())
+    return default_command_timeout_seconds()
+
+
+def claim_is_active(event: dict[str, Any], current_time: float) -> bool:
+    expires_at = event.get("claim_expires_at_unix")
+    return isinstance(expires_at, (int, float)) and current_time <= float(expires_at)
+
+
+def claim_event(hook_input: dict[str, Any], hook_cwd: Path, hook_id: str) -> bool:
+    if not event_file(hook_cwd).exists():
         return False
-    return True
+    with locked_event(hook_cwd):
+        if not event_file(hook_cwd).exists():
+            return False
+        event = load_event(hook_cwd)
+        if not event:
+            return False
+        if not event_matches_context(event, hook_input, hook_cwd):
+            return False
+        current_time = now_unix()
+        status = event.get("status")
+        if status in ("pending", "finished") and not event.get("timeout_count") and not is_event_fresh(event, current_time):
+            clear_event(hook_cwd)
+            return False
+
+        if status not in ("pending", "claimed", "timeout_waiting", "finished"):
+            return False
+        if event.get("claimed_by") and event.get("claimed_by") != hook_id and claim_is_active(event, current_time):
+            return False
+
+        poll_seconds = env_positive_int("FOLLOW_UP_HOOK_POLL_SECONDS", DEFAULT_HOOK_POLL_SECONDS)
+        claim_grace = max(HOOK_TIMEOUT_MARGIN_SECONDS, poll_seconds * 2)
+        timeout_seconds = event_timeout_seconds(event)
+        event["claimed_by"] = hook_id
+        event["claimed_at"] = now_iso()
+        event["claimed_at_unix"] = current_time
+        event["claim_expires_at_unix"] = current_time + timeout_seconds + claim_grace
+        event["hook_session_id"] = hook_session_id(hook_input)
+        event["hook_cwd"] = hook_input.get("cwd")
+        if status in ("pending", "claimed", "timeout_waiting"):
+            event["status"] = "claimed"
+        write_event(event, hook_cwd)
+        return True
 
 
-def pending_run_exists() -> bool:
-    for run_dir in iter_run_dirs():
-        if is_delivered(run_dir):
-            continue
-        request = read_json(run_dir / "request.json")
-        if isinstance(request, dict):
-            return True
-    return False
+def read_claimed_event(hook_cwd: Path, hook_id: str) -> dict[str, Any] | None:
+    with locked_event(hook_cwd):
+        event = load_event(hook_cwd)
+        if not event or event.get("claimed_by") != hook_id:
+            return None
+        return event
 
 
-def fence_text(text: str) -> str:
-    return text.replace("```", "`` `")
+def clear_claimed_event(hook_cwd: Path, hook_id: str) -> dict[str, Any] | None:
+    with locked_event(hook_cwd):
+        event = load_event(hook_cwd)
+        if not event or event.get("claimed_by") != hook_id:
+            return None
+        clear_event(hook_cwd)
+        return event
 
 
-def build_run_feedback(run_dir: Path) -> str:
-    request = read_json(run_dir / "request.json", {})
-    result = read_json(run_dir / "result.json", {})
-    if not isinstance(request, dict):
-        request = {}
+def mark_timed_out_event(hook_cwd: Path, hook_id: str, timeout_seconds: int) -> dict[str, Any] | None:
+    with locked_event(hook_cwd):
+        event = load_event(hook_cwd)
+        if event and event.get("claimed_by") == hook_id and event.get("status") != "finished":
+            event["status"] = "timeout_waiting"
+            event["last_timeout_at"] = now_iso()
+            event["last_timeout_at_unix"] = now_unix()
+            event["last_timeout_seconds"] = timeout_seconds
+            timeout_count = event.get("timeout_count")
+            event["timeout_count"] = (timeout_count if isinstance(timeout_count, int) else 0) + 1
+            event["last_timed_out_by"] = hook_id
+            event.pop("claimed_by", None)
+            event.pop("claim_expires_at_unix", None)
+            write_event(event, hook_cwd)
+            return event
+        return None
+
+
+def build_event_feedback(event: dict[str, Any]) -> str:
+    result = event.get("result")
     if not isinstance(result, dict):
         result = {}
 
@@ -381,19 +500,16 @@ def build_run_feedback(run_dir: Path) -> str:
     lines = [
         "# Follow Up",
         "",
-        "The previous Codex shell command has completed. Use the command output already visible in the Codex transcript.",
+        "The previous Codex shell command has completed. Use the command output already visible in the transcript.",
         "",
         "## Follow-up Instruction",
         "",
-        str(request.get("feedback", "")).strip() or "(none)",
+        str(event.get("feedback", "")).strip() or "(none)",
         "",
         "## Result",
         "",
-        f"- Run id: `{request.get('run_id', run_dir.name)}`",
         f"- Exit code: `{exit_code if exit_code is not None else 'unknown'}`",
         f"- Status: `{result.get('status', 'unknown')}`",
-        f"- Finished: `{result.get('finished_at', 'unknown')}`",
-        f"- Working directory: `{request.get('cwd', 'unknown')}`",
     ]
 
     if failed:
@@ -408,82 +524,110 @@ def build_run_feedback(run_dir: Path) -> str:
             ]
         )
 
-    lines.extend(
-        [
-            "",
-            "Follow Up did not execute or capture the command. It only registered this Stop-hook feedback after the command finished.",
-        ]
-    )
+    return "\n".join(lines)
+
+
+def build_timeout_feedback(event: dict[str, Any], timeout_seconds: int) -> str:
+    elapsed = int(now_unix() - float(event.get("created_at_unix", now_unix())))
+    lines = [
+        "# Follow Up Timeout",
+        "",
+        "The long-running shell command has not recorded completion before the follow-up timeout gate.",
+        "",
+        "## What To Do Now",
+        "",
+        "Inspect the running command only enough to decide whether it is making normal progress or appears stuck.",
+        "If it is stuck, diagnose the cause and either fix/retry or report the blocker with evidence.",
+        "If it appears to be running normally and just needs more time, end this turn immediately again. Do not create a new follow-up event and do not rerun the command; the next Stop hook will wait for another timeout interval.",
+        "",
+        "## Event",
+        "",
+        f"- Event id: `{event.get('event_id', 'unknown')}`",
+        f"- Timeout gate: `{timeout_seconds}` seconds",
+        f"- Elapsed since armed: `{elapsed}` seconds",
+        f"- Timeout count: `{event.get('timeout_count', 0)}`",
+        f"- Working directory: `{event.get('cwd', 'unknown')}`",
+        f"- Session id: `{event.get('session_id', 'unknown')}`",
+        "",
+        "The original shell suffix is still responsible for running `follow-up --finished --exit-code \"$rc\"` when the command exits.",
+    ]
     return "\n".join(lines)
 
 
 def run_hook() -> int:
     hook_input = load_hook_input()
-
-    matching = [run_dir for run_dir in iter_run_dirs() if run_matches_hook(run_dir, hook_input)]
-    if not matching:
-        if not pending_run_exists():
-            unregister_hook()
+    hook_cwd_value = hook_input.get("cwd")
+    hook_cwd = Path(hook_cwd_value) if isinstance(hook_cwd_value, str) else Path.cwd()
+    if not hook_session_id(hook_input):
         return 0
 
-    feedback_blocks = []
-    for run_dir in matching:
-        feedback_blocks.append(build_run_feedback(run_dir))
-        atomic_write_json(run_dir / "delivered.json", {"delivered_at": now_iso()})
+    hook_id = event_id("hook-")
+    if not claim_event(hook_input, hook_cwd, hook_id):
+        return 0
 
-    removed, unregister_error = (False, None)
-    if not pending_run_exists():
-        removed, unregister_error = unregister_hook()
+    event = read_claimed_event(hook_cwd, hook_id)
+    if not event:
+        return 0
+    wait_seconds = event_timeout_seconds(event)
+    poll_seconds = env_positive_int("FOLLOW_UP_HOOK_POLL_SECONDS", DEFAULT_HOOK_POLL_SECONDS)
+    deadline = now_unix() + wait_seconds
 
-    if unregister_error:
-        feedback_blocks.append(
-            "\n".join(
-                [
-                    "# follow-up cleanup warning",
-                    "",
-                    "The feedback was delivered, but the managed hook could not be unregistered automatically.",
-                    f"Error: `{unregister_error}`",
-                    f"Hooks file: `{hooks_file()}`",
-                ]
-            )
-        )
-    elif removed:
-        feedback_blocks.append("follow-up cleanup: managed Stop hook unregistered.")
+    while True:
+        event = read_claimed_event(hook_cwd, hook_id)
+        if not event:
+            return 0
+        if event.get("status") == "finished" and isinstance(event.get("result"), dict):
+            event = clear_claimed_event(hook_cwd, hook_id)
+            if event:
+                json_hook_response(build_event_feedback(event))
+            return 0
 
-    json_hook_response("\n\n---\n\n".join(feedback_blocks))
-    return 0
+        remaining = deadline - now_unix()
+        if remaining <= 0:
+            event = mark_timed_out_event(hook_cwd, hook_id, wait_seconds)
+            if event:
+                json_hook_response(build_timeout_feedback(event, wait_seconds))
+            return 0
+        time.sleep(min(poll_seconds, remaining))
 
 
 def print_status() -> None:
     print(f"state dir: {state_root()}")
+    print(f"event file: {event_file()}")
     print(f"hooks file: {hooks_file()}")
-    run_dirs = iter_run_dirs()
-    if not run_dirs:
-        print("runs: none")
+    with locked_event():
+        event = load_event()
+    if not event:
+        print("event: none")
         return
-    for run_dir in run_dirs:
-        request = read_json(run_dir / "request.json", {})
-        result = read_json(run_dir / "result.json", {})
-        if not isinstance(request, dict):
-            request = {}
-        if not isinstance(result, dict):
-            result = {}
-        delivered = "yes" if is_delivered(run_dir) else "no"
-        status = result.get("status", "unknown")
-        exit_code = result.get("exit_code", "unknown")
-        print(f"{run_dir.name}: status={status} exit={exit_code} delivered={delivered}")
-        print(f"  feedback: {request.get('feedback', '')}")
-        print(f"  dir: {run_dir}")
+
+    result = event.get("result")
+    if not isinstance(result, dict):
+        result = {}
+    print(f"event: {event.get('event_id', 'unknown')}")
+    print(f"  status: {event.get('status', 'unknown')}")
+    print(f"  timeout: {event.get('timeout_seconds', 'unknown')}")
+    print(f"  timeout_count: {event.get('timeout_count', 0)}")
+    print(f"  exit: {result.get('exit_code', 'unknown')}")
+    print(f"  session: {event.get('session_id', 'unknown')}")
+    print(f"  claimed_by: {event.get('claimed_by', 'none')}")
+    print(f"  feedback: {event.get('feedback', '')}")
 
 
-def parse_start_args(argv: list[str]) -> tuple[argparse.Namespace, str, int | None]:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="follow-up",
-        description="Register a Codex Stop hook that returns follow-up feedback after the preceding shell command.",
+        description="Arm or finish follow-up feedback for the installed Codex Stop hook.",
     )
     parser.add_argument("--version", action="store_true", help="print version and exit")
-    parser.add_argument("--status", action="store_true", help="show managed notifications")
-    parser.add_argument("--unregister", action="store_true", help="remove the managed Stop hook entry")
+    parser.add_argument("--status", action="store_true", help="show the active follow-up event")
+    parser.add_argument("--finished", action="store_true", help="mark the active follow-up event finished")
+    parser.add_argument(
+        "--timeout",
+        type=lambda value: parse_positive_int(value, "--timeout"),
+        default=None,
+        help="expected maximum command runtime in seconds before the hook asks Codex to inspect progress",
+    )
     parser.add_argument(
         "--exit-code",
         type=lambda value: parse_int(value, "--exit-code"),
@@ -491,25 +635,7 @@ def parse_start_args(argv: list[str]) -> tuple[argparse.Namespace, str, int | No
         help="exit code from the preceding command; use --exit-code \"$rc\" after saving $?",
     )
     parser.add_argument("feedback", nargs=argparse.REMAINDER)
-    ns = parser.parse_args(argv)
-
-    if ns.version or ns.status or ns.unregister:
-        return ns, "", None
-
-    items = list(ns.feedback)
-    if "--" in items:
-        raise UserError(
-            "follow-up does not execute commands; use: command; rc=$?; "
-            'follow-up --exit-code "$rc" "feedback"; exit "$rc"'
-        )
-    feedback = " ".join(items).strip()
-    if not feedback:
-        raise UserError('usage: follow-up [--exit-code N] "feedback text"')
-
-    exit_code = ns.exit_code
-    if exit_code is None:
-        exit_code = exit_code_from_env()
-    return ns, feedback, exit_code
+    return parser
 
 
 def main(argv: list[str]) -> int:
@@ -517,20 +643,27 @@ def main(argv: list[str]) -> int:
         return run_hook()
 
     try:
-        ns, feedback, exit_code = parse_start_args(argv)
+        ns = build_parser().parse_args(argv)
         if ns.version:
             print(VERSION)
             return 0
         if ns.status:
             print_status()
             return 0
-        if ns.unregister:
-            changed, error = unregister_hook()
-            if error:
-                raise UserError(error)
-            print("managed Stop hook removed" if changed else "managed Stop hook not present")
+        if ns.finished:
+            if ns.feedback:
+                raise UserError("--finished does not accept feedback text")
+            if ns.timeout is not None:
+                raise UserError("--timeout is only valid when arming a follow-up event")
+            exit_code = ns.exit_code
+            if exit_code is None:
+                exit_code = exit_code_from_env()
+            finish_event(exit_code)
             return 0
-        create_notification(feedback, exit_code)
+        if ns.exit_code is not None:
+            raise UserError("--exit-code is only valid with --finished")
+        timeout_seconds = validate_command_timeout(ns.timeout) if ns.timeout is not None else default_command_timeout_seconds()
+        arm_event(join_feedback(list(ns.feedback)), timeout_seconds)
         return 0
     except UserError as exc:
         print(f"follow-up: {exc}", file=sys.stderr)

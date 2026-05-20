@@ -4,9 +4,174 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CODEX_CONFIG_HOME="${CODEX_HOME:-$HOME/.codex}"
+HOOKS_FILE="${FOLLOW_UP_HOOKS_FILE:-$CODEX_CONFIG_HOME/hooks.json}"
+HOOK_TIMEOUT="${FOLLOW_UP_HOOK_TIMEOUT:-7200}"
+PYTHON_BIN="${PYTHON:-$(command -v python3)}"
+MODE="install"
+
+if [[ "${1:-}" == "--uninstall-hook" || "${1:-}" == "--unregister" ]]; then
+    MODE="uninstall"
+elif [[ $# -gt 0 ]]; then
+    echo "usage: $0 [--uninstall-hook]" >&2
+    exit 2
+fi
 
 SKILLS_DIR="$CODEX_CONFIG_HOME/skills"
 DEST_SKILL="$SKILLS_DIR/follow-up"
+
+shell_quote() {
+    printf '%q' "$1"
+}
+
+install_or_uninstall_hook() {
+    local mode="$1"
+    local hook_command
+    hook_command="FOLLOW_UP_MANAGED=1 CODEX_HOME=$(shell_quote "$CODEX_CONFIG_HOME") FOLLOW_UP_HOOK_TIMEOUT=$(shell_quote "$HOOK_TIMEOUT") $(shell_quote "$PYTHON_BIN") $(shell_quote "$DEST_SKILL/scripts/follow-up") --hook"
+    if [[ -n "${FOLLOW_UP_STATE_DIR:-}" ]]; then
+        hook_command="FOLLOW_UP_STATE_DIR=$(shell_quote "$FOLLOW_UP_STATE_DIR") $hook_command"
+    fi
+    if [[ -n "${FOLLOW_UP_HOOKS_FILE:-}" ]]; then
+        hook_command="FOLLOW_UP_HOOKS_FILE=$(shell_quote "$FOLLOW_UP_HOOKS_FILE") $hook_command"
+    fi
+    if [[ -n "${FOLLOW_UP_HOOK_POLL_SECONDS:-}" ]]; then
+        hook_command="FOLLOW_UP_HOOK_POLL_SECONDS=$(shell_quote "$FOLLOW_UP_HOOK_POLL_SECONDS") $hook_command"
+    fi
+    if [[ -n "${FOLLOW_UP_ARM_MAX_AGE_SECONDS:-}" ]]; then
+        hook_command="FOLLOW_UP_ARM_MAX_AGE_SECONDS=$(shell_quote "$FOLLOW_UP_ARM_MAX_AGE_SECONDS") $hook_command"
+    fi
+
+    FOLLOW_UP_INSTALL_MODE="$mode" \
+    FOLLOW_UP_HOOK_COMMAND="$hook_command" \
+    FOLLOW_UP_HOOKS_FILE_EFFECTIVE="$HOOKS_FILE" \
+    FOLLOW_UP_HOOK_TIMEOUT_EFFECTIVE="$HOOK_TIMEOUT" \
+    "$PYTHON_BIN" - <<'PY'
+import json
+import os
+import time
+from pathlib import Path
+
+MARKER = "FOLLOW_UP_MANAGED=1"
+
+
+def read_json(path):
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {"description": "Codex hooks", "hooks": {}}
+
+
+def atomic_write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def normalize(data, path):
+    if not isinstance(data, dict):
+        raise SystemExit(f"hooks file must contain a JSON object: {path}")
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise SystemExit(f"hooks file has invalid 'hooks' object: {path}")
+    if hooks.get("Stop") is None:
+        hooks["Stop"] = []
+    if "Stop" not in hooks:
+        hooks["Stop"] = []
+    if not isinstance(hooks["Stop"], list):
+        raise SystemExit("hooks.Stop must be an array")
+    return data
+
+
+def is_managed(hook):
+    if not isinstance(hook, dict):
+        return False
+    command = hook.get("command")
+    return isinstance(command, str) and MARKER in command and "--hook" in command
+
+
+def prune(data):
+    groups = data["hooks"]["Stop"]
+    new_groups = []
+    changed = False
+    for group in groups:
+        if not isinstance(group, dict):
+            new_groups.append(group)
+            continue
+        group_hooks = group.get("hooks", [])
+        if not isinstance(group_hooks, list):
+            new_groups.append(group)
+            continue
+        kept_hooks = [hook for hook in group_hooks if not is_managed(hook)]
+        if len(kept_hooks) != len(group_hooks):
+            changed = True
+        if kept_hooks:
+            new_group = dict(group)
+            new_group["hooks"] = kept_hooks
+            new_groups.append(new_group)
+        else:
+            other_keys = {k: v for k, v in group.items() if k != "hooks"}
+            if other_keys:
+                new_group = dict(other_keys)
+                new_group["hooks"] = []
+                new_groups.append(new_group)
+    if changed:
+        data["hooks"]["Stop"] = new_groups
+    return changed
+
+
+mode = os.environ["FOLLOW_UP_INSTALL_MODE"]
+path = Path(os.environ["FOLLOW_UP_HOOKS_FILE_EFFECTIVE"]).expanduser()
+data = normalize(read_json(path), path)
+changed = prune(data)
+
+if mode == "install":
+    try:
+        timeout = int(os.environ["FOLLOW_UP_HOOK_TIMEOUT_EFFECTIVE"])
+    except ValueError as exc:
+        raise SystemExit("FOLLOW_UP_HOOK_TIMEOUT must be an integer") from exc
+    if timeout <= 0:
+        raise SystemExit("FOLLOW_UP_HOOK_TIMEOUT must be positive")
+    data["hooks"]["Stop"].append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": os.environ["FOLLOW_UP_HOOK_COMMAND"],
+                    "timeout": timeout,
+                    "statusMessage": "follow-up waiting for command completion",
+                }
+            ]
+        }
+    )
+    changed = True
+elif mode != "uninstall":
+    raise SystemExit(f"unknown install mode: {mode}")
+
+if changed:
+    if path.exists():
+        backup = path.with_name(f"{path.name}.bak.follow-up")
+        try:
+            backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError:
+            pass
+    atomic_write_json(path, data)
+
+if mode == "install":
+    print(f"persistent Stop hook installed: {path}")
+elif changed:
+    print(f"persistent Stop hook removed: {path}")
+else:
+    print(f"persistent Stop hook not present: {path}")
+PY
+}
+
+if [[ "$MODE" == "uninstall" ]]; then
+    install_or_uninstall_hook uninstall
+    exit 0
+fi
 
 mkdir -p "$SKILLS_DIR"
 
@@ -17,18 +182,21 @@ if [[ "$SOURCE_ROOT" != "$DEST_SKILL" ]]; then
     rm -rf \
         "$TMP_DEST/.git" \
         "$TMP_DEST/.agents" \
-        "$TMP_DEST/.codex"
+        "$TMP_DEST/.codex" \
+        "$TMP_DEST/.follow-up"
     rm -rf "$DEST_SKILL"
     mv "$TMP_DEST" "$DEST_SKILL"
 fi
 
 chmod +x "$DEST_SKILL/scripts/follow-up"
 chmod +x "$DEST_SKILL/scripts/install-codex"
+install_or_uninstall_hook install
 
 cat <<EOF
 follow-up installed.
   skill:    $DEST_SKILL
   entrypoint: $DEST_SKILL/scripts/follow-up
+  stop hook:  installed in $HOOKS_FILE
 
 Restart Codex to pick up the skill metadata.
 EOF
