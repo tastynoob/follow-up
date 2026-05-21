@@ -76,6 +76,8 @@ The queued notification requires a Codex session id from `CODEX_THREAD_ID` or `C
 
 The Stop hook does not deliver arbitrary old completed notifications. On each Stop event it claims only the fresh active event that was armed shortly before the Stop event, then polls it every 10 seconds until `--finished` records the result or the event timeout expires. If no fresh event exists, the hook returns immediately. After completion feedback is sent, `.follow-up/event.json` is deleted.
 
+If the Stop hook is interrupted or killed before it finishes, it clears the claim on signal when possible. If it is killed uncleanly, the next Stop event discards the stale claim once the claimed hook process is no longer running, so old feedback is not replayed later.
+
 If the event timeout expires before `--finished`, the hook returns a timeout prompt instead of clearing the event. That prompt asks Codex to inspect whether the command is making normal progress or appears stuck. If it is still progressing normally, Codex should stop again without creating a new follow-up event; the next Stop hook will reclaim the same event and wait another timeout interval.
 
 When `--exit-code` is nonzero, the hook adds a default failure prompt asking Codex to inspect the output, diagnose the failure, and recover or report the blocker.
